@@ -2,7 +2,7 @@ name: astrbot_plugin_media_montage_429
 display_name: 媒体拼图 4.29+ 专版（视频抽帧）
 desc: AstrBot 4.29+ 专版：让视频以与动图完全相同的抽帧拼图逻辑被模型理解。零注入、只用官方钩子，不包含旧版兼容功能。
 short_desc: 4.29+ 专版，视频抽帧拼图（零注入）。
-version: v1.0.0
+version: v1.0.1
 author: Iris1598
 repo: https://github.com/iris1598/astrbot_plugin_media_montage
 # 专版仅面向 AstrBot >= 4.29（插件内部加载时校验）。

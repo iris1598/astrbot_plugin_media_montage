@@ -191,6 +191,37 @@ async def main() -> None:
             vm = Image.open(montage_path)
             check("视频拼图为 3x3", vm.size == (960, 720), str(vm.size))
 
+        # 长视频：验证 seek 抽帧（时长已知时走按时间点路径）
+        import time as _time
+
+        long_video = Path(tmp) / "long.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i",
+                "testsrc=duration=30:size=320x240:rate=5",
+                "-pix_fmt", "yuv420p", str(long_video),
+            ],
+            check=True,
+        )
+        t0 = _time.time()
+        long_frames = await plugin._extract_video_frames(str(long_video))
+        elapsed = _time.time() - t0
+        check(
+            "长视频（30s）按 seek 抽满 9 帧",
+            len(long_frames) == plugin.video_frames,
+            f"got {len(long_frames)} in {elapsed:.1f}s",
+        )
+        check(
+            "长视频帧取自不同时间点（首尾帧不同）",
+            long_frames[0] != long_frames[-1],
+        )
+        long_montage = await plugin._build_video_montage(str(long_video))
+        check(
+            "长视频拼图生成成功",
+            bool(long_montage) and Path(long_montage).is_file(),
+        )
+
         from astrbot.core.agent.message import TextPart
 
         check(

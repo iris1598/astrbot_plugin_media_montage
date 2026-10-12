@@ -202,7 +202,7 @@ def _compose_montage(
     PLUGIN_NAME,
     "WorkBuddy",
     "AstrBot 4.29+ 专版：让视频以抽帧拼图的方式被模型看懂（零注入，只用官方钩子）。",
-    "1.0.0",
+    "1.0.1",
 )
 class MediaMontagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -400,27 +400,129 @@ class MediaMontagePlugin(Star):
             return None
         return path
 
-    async def _extract_video_frames(self, video_path: str) -> list[bytes]:
-        """用 ffmpeg 对视频等间隔抽帧，返回按时间排序的编码帧。
+    def _scale_filter(self) -> str:
+        """仅在源分辨率过大时缩小的滤镜；不会放大。"""
+        box = max(self.video_max_size, 16) * self.video_grid
+        return (
+            "scale=w='if(gte(iw,ih),min(iw,{b}),-2)':"
+            "h='if(gte(iw,ih),-2,min(ih,{b}))'".format(b=box)
+        )
 
-        中间帧写成 PNG（无损，且不像 mjpeg 那样拒收 full-range YUV），
-        最终由 `_compose_montage` 统一缩放并压成一张 JPEG。
+    async def _extract_video_frames(self, video_path: str) -> list[bytes]:
+        """抽帧，返回按时间排序的编码帧。
+
+        优先"按时间点 seek 抽帧"：时长已知时，把 count 个采样点均匀分布在
+        整段时长上（取中点位置），逐个用 `-ss` 输入 seek 抽取——每次只需
+        解码目标时间点附近的一个 GOP，长视频（数分钟、上百 MB）也能秒级
+        完成。旧实现用 `fps=N/duration` 滤镜等间隔采样，必须从头解码整段
+        视频，长视频很容易超出超时，导致一张帧都抽不到、模型完全看不到
+        画面。读不出时长时才退回 fps 滤镜全解码（短视频场景，开销可忽略）。
         """
         count = self.video_frames
         duration = await self._probe_duration(video_path)
-        # 等间隔抽帧：把整段时长压缩成 count 个采样点。
+        if duration and duration > 0:
+            frames = await self._extract_frames_by_seek(video_path, duration, count)
+            if frames:
+                return frames
+            # seek 全部失败（罕见：损坏的索引等）时退回全解码再试一次。
+            logger.warning(
+                "[media_montage_429] 按时间点抽帧未得到任何帧，退回全解码重试: %s",
+                video_path,
+            )
+        return await self._extract_frames_by_fps(video_path, count)
+
+    async def _run_ffmpeg(self, command: list[str]) -> tuple[int, bytes]:
+        """运行一次 ffmpeg，返回 (returncode, stderr)。
+
+        未安装 ffmpeg 时返回 (-1, b"")；超时返回 (-2, b"")。
+        """
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            logger.error(
+                "[media_montage_429] 未找到 ffmpeg，无法对视频抽帧。"
+                "请安装 ffmpeg 并确保在 PATH 中。"
+            )
+            return -1, b""
+        try:
+            _, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=self.video_timeout
+            )
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            logger.warning(
+                "[media_montage_429] ffmpeg 运行超时（%ss）: %s",
+                self.video_timeout,
+                " ".join(command[:8]),
+            )
+            return -2, b""
+        return process.returncode or 0, stderr or b""
+
+    async def _extract_frames_by_seek(
+        self, video_path: str, duration: float, count: int
+    ) -> list[bytes]:
+        """按均匀分布的时间点逐帧 seek 抽取（长视频友好）。"""
+        timestamps = [duration * (index + 0.5) / count for index in range(count)]
+        temp_dir = tempfile.mkdtemp(prefix="media_montage_frames_")
+        frames: list[bytes] = []
+        try:
+            for index, timestamp in enumerate(timestamps):
+                output = os.path.join(temp_dir, f"frame_{index:03d}.png")
+                command = [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    f"{timestamp:.3f}",
+                    "-i",
+                    video_path,
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    self._scale_filter(),
+                    output,
+                ]
+                returncode, stderr = await self._run_ffmpeg(command)
+                if returncode != 0:
+                    if returncode > 0:
+                        logger.warning(
+                            "[media_montage_429] 第 %d 帧抽帧失败: %s",
+                            index + 1,
+                            (stderr or b"").decode(errors="ignore").strip(),
+                        )
+                    continue
+                try:
+                    if os.path.getsize(output) > 0:
+                        frames.append(
+                            await asyncio.to_thread(Path(output).read_bytes)
+                        )
+                except OSError:
+                    continue
+            return frames
+        finally:
+            _remove_tree(temp_dir)
+
+    async def _extract_frames_by_fps(self, video_path: str, count: int) -> list[bytes]:
+        """fps 滤镜等间隔抽帧（全解码，仅作兜底；中间帧写 PNG）。
+
+        最终由 `_compose_montage` 统一缩放并压成一张 JPEG。
+        """
+        duration = await self._probe_duration(video_path)
         if duration and duration > 0:
             fps = max(count / duration, 1e-6)
             filters = [f"fps={fps:.6f}"]
         else:
             # 读不出时长时退化为每秒 1 帧，取前 count 帧。
             filters = ["fps=1"]
-        # 只在源分辨率过大时缩小，避免抽到 4K 帧把临时目录撑爆；不会放大。
-        box = max(self.video_max_size, 16) * self.video_grid
-        filters.append(
-            "scale=w='if(gte(iw,ih),min(iw,{b}),-2)':"
-            "h='if(gte(iw,ih),-2,min(ih,{b}))'".format(b=box)
-        )
+        filters.append(self._scale_filter())
         vf = ",".join(filters)
 
         temp_dir = tempfile.mkdtemp(prefix="media_montage_frames_")
@@ -439,38 +541,13 @@ class MediaMontagePlugin(Star):
                 str(count),
                 pattern,
             ]
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            except FileNotFoundError:
-                logger.error(
-                    "[media_montage_429] 未找到 ffmpeg，无法对视频抽帧。"
-                    "请安装 ffmpeg 并确保在 PATH 中。"
-                )
-                return []
-
-            try:
-                _, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=self.video_timeout
-                )
-            except asyncio.TimeoutError:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-                logger.warning(
-                    "[media_montage_429] 视频抽帧超时（%ss）: %s",
-                    self.video_timeout,
-                    video_path,
-                )
-                return []
-
-            if process.returncode != 0:
-                message = (stderr or b"").decode(errors="ignore").strip()
-                logger.warning("[media_montage_429] ffmpeg 抽帧失败: %s", message)
+            returncode, stderr = await self._run_ffmpeg(command)
+            if returncode != 0:
+                if returncode > 0:
+                    logger.warning(
+                        "[media_montage_429] ffmpeg 抽帧失败: %s",
+                        (stderr or b"").decode(errors="ignore").strip(),
+                    )
                 return []
 
             files = sorted(Path(temp_dir).glob("frame_*.png"))
