@@ -1,37 +1,31 @@
-"""astrbot_plugin_media_montage
+"""astrbot_plugin_media_montage_429
 
-把"动图抽帧拼图"这件事做完整：既是补丁，也是增强。
+AstrBot 4.29+ 专版的"视频抽帧拼图"插件。
 
-一、动图拼图提示补丁（仅 AstrBot 4.28.1 / 4.28.2 生效）
-    AstrBot 从 4.28.1 起，内置 Agent 会把消息里的动图（GIF / APNG / 动态 WebP）
-    转成一张 3x3 的"抽帧拼图"再交给模型。但这两个版本忘了告诉模型"这是一张动图"，
-    于是模型会把拼图当成一张静态图（或几张并排的图）来理解，经常看不懂。
-    官方后续补丁的做法是：往本轮请求里追加一条临时的 <system_notice> 提示。
-    本插件用插件的方式把这条提示补回来，行为与官方补丁保持一致
-    （同样标记为临时内容，不写入会话历史）。
+一、与通用版的区别
+    - **零注入**：不包装、不替换 AstrBot 核心的任何函数，只用官方公开的
+      `on_llm_request` 钩子与 `req` 实体，随插件卸载即完全还原。
+    - **剔除旧版功能**：通用版里为 4.28.1/4.28.2 补的"动图拼图提示"、
+      版本门控探测、消息链兜底解析等基于旧核心的逻辑全部移除——
+      4.29+ 的官方修复已接管动图提示，插件不再重复。
 
-二、视频抽帧拼图（所有 AstrBot 版本生效）
-    消息里的视频目前只会以一行文本 "[Video Attachment: ...]" 的形式进入请求，
-    模型看不到画面。本插件用 ffmpeg 对视频等间隔抽帧，然后套用与动图**完全相同**
-    的 3x3 拼图逻辑合成一张图片，追加到 req.image_urls 里，并附带同样的提示。
-
-    4.29+ 的官方写法：核心在 on_llm_request 钩子之前就把视频落地为本地文件，
-    并以 "[Video Attachment: name X, path Y]" 标签写进 req.extra_user_content_parts。
-    插件优先解析这些官方标签、直接复用核心的解析结果；标签缺失时（老版本核心）
-    才回退为遍历消息链解析视频组件。
+二、本版只做一件事：视频抽帧拼图
+    消息里的视频在核心里只是一行文本 "[Video Attachment: name X, path Y]"，
+    模型看不到画面。本插件解析核心在 on_llm_request 钩子**之前**就已写好的
+    官方视频标签（astr_main_agent._append_video_attachment 的产物），直接
+    复用核心的解析结果：用 ffmpeg 对视频等间隔抽帧，套用与官方动图完全
+    相同的 3x3 拼图逻辑合成一张图片，追加进 req.image_urls，并按官方
+    montage notice 的风格附加 <system_notice> 提示（临时内容，不落库）。
+    钩子之后核心的 prepare_request_images 会统一完成图片准备与标注。
 
 设计要点
 --------
-1. 精确探测"这一轮到底有没有生成拼图"：
-   核心在 `image_input.prepare_request_images()` 里调用
-   `media_utils.prepare_model_image()`，只有帧数 > 1 时才走拼图分支。
-   插件在加载时包装这个函数（media_utils 与 image_input 两处绑定都要换），
-   把"产出路径 -> 是否为拼图"记下来；钩子里只要 req.image_urls 命中记录，
-   就说明本轮确实有拼图，与官方补丁的 has_montage 语义完全一致。
-2. 视频走同一套拼图逻辑：3x3 网格、白色背景、帧按阅读顺序排布、
-   最长边不超过 montage_max_size，和 `_extract_animation_montage_sync` 一致。
-3. 版本门控：动图提示只对 4.28.x 的这两个版本生效（更早的版本没有拼图机制，
-   提示会误导模型；更晚的版本应当由官方修复接管）。视频抽帧不设版本限制。
+1. 只信官方标签：视频来源唯一途径是 req.extra_user_content_parts 里的
+   "[Video Attachment: ...]" / "[Video Attachment in quoted message: ...]"。
+   标签不存在就什么都不做（例如引用视频落地失败时核心只保留 ref）。
+2. 版本要求：加载时校验 AstrBot >= 4.29.0，不满足则拒绝启用并给出明确日志。
+3. 失败绝不打断主流程：抽帧、合成、探测全部包在 try/except 中，
+   任何一步失败都只是退化为原有行为（视频对模型不可见）。
 """
 
 from __future__ import annotations
@@ -41,7 +35,6 @@ import io
 import os
 import re
 import tempfile
-from collections import OrderedDict
 from pathlib import Path
 
 from astrbot.api import logger
@@ -54,32 +47,13 @@ except Exception:  # pragma: no cover - 仅作类型注解降级
     AstrBotConfig = dict  # type: ignore[misc,assignment]
 
 # ---------------------------------------------------------------------------
-# 消息组件类型：优先从官方 api 导入，失败则退回 core
-# ---------------------------------------------------------------------------
-try:
-    from astrbot.api.message_components import Reply, Video
-except Exception:  # pragma: no cover
-    try:
-        from astrbot.core.message.components import Reply, Video
-    except Exception:  # pragma: no cover
-        Reply = None  # type: ignore[assignment]
-        Video = None  # type: ignore[assignment]
-
-# ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-PLUGIN_NAME = "astrbot_plugin_media_montage"
+PLUGIN_NAME = "astrbot_plugin_media_montage_429"
 
-GIF_FIX_VERSIONS: frozenset[tuple[int, int, int]] = frozenset(
-    {(4, 28, 1), (4, 28, 2)}
-)
-"""动图拼图提示补丁只在这些 AstrBot 版本上生效。"""
+MIN_ASTRBOT_VERSION = (4, 29, 0)
+"""本专版要求的最低 AstrBot 版本。"""
 
-DEFAULT_GIF_NOTICE = (
-    "The input includes a GIF converted into a single image with frames "
-    "in reading order. Treat it as an animation; "
-    "do not mention the conversion or frame layout."
-)
 DEFAULT_VIDEO_NOTICE = (
     "The input includes a video converted into a single image with frames "
     "in reading order. Treat this image as a sequence of video frames; "
@@ -92,30 +66,6 @@ _OFFICIAL_VIDEO_LABEL_RE = re.compile(
     r"^\[Video Attachment(?: in quoted message)?: "
     r"name (?P<name>.+?), path (?P<path>.+)\]$"
 )
-
-_WRAP_MARK = "__media_montage_wrapped__"
-_PATCH_MODULE_ATTR = "_media_montage_original"
-
-
-class _MontagePathRegistry(OrderedDict):
-    """有界的 "产出路径 -> True" 记录表，避免长时间运行后无限增长。"""
-
-    def __init__(self, maxlen: int = 2048) -> None:
-        super().__init__()
-        self._maxlen = maxlen
-
-    def mark(self, path: str) -> None:
-        self[path] = True
-        self.move_to_end(path)
-        while len(self) > self._maxlen:
-            self.popitem(last=False)
-
-    def contains(self, path: object) -> bool:
-        return isinstance(path, str) and path in self
-
-
-_MONTAGE_PATHS = _MontagePathRegistry()
-"""prepare_model_image 产出路径中，哪些是动图拼图。"""
 
 
 # ---------------------------------------------------------------------------
@@ -140,54 +90,12 @@ def _get_astrbot_version() -> str:
 
 
 def _version_tuple(version: str) -> tuple[int, int, int]:
-    """把 "4.28.2" / "v4.28.2-beta.1" 这类字符串解析成 (4, 28, 2)。"""
+    """把 "4.29.0" / "v4.29.1-beta.1" 这类字符串解析成 (4, 29, 0)。"""
     nums = re.findall(r"\d+", version or "")
     parts = [int(n) for n in nums[:3]]
     while len(parts) < 3:
         parts.append(0)
     return parts[0], parts[1], parts[2]
-
-
-def _core_already_reports_montage() -> bool:
-    """检测核心是否已经自带"拼图提示"（官方修复已合入）。
-
-    官方修复的特征是 `prepare_request_images` 里出现拼图标记与
-    ``<system_notice>``。若已合入，插件让位，避免给模型重复提示。
-
-    兼容两种核心布局：
-    - AstrBot 4.29+：`astrbot.core.utils.image_input`（重构后的新位置）；
-    - AstrBot 4.28.x：`astrbot.core.pipeline.process_stage.method.agent_sub_stages.image_input`。
-
-    特征匹配同时覆盖两个版本的官方实现：4.28 的修复用 ``has_montage``，
-    4.29 重构后改用 ``is_montage`` / "frame montage" 文案，共同点是
-    ``<system_notice>`` 与 "montage" 字样同时出现。
-    """
-    try:
-        import inspect
-        from importlib import import_module
-    except Exception:  # pragma: no cover
-        return False
-
-    candidate_modules = (
-        "astrbot.core.utils.image_input",  # 4.29+
-        "astrbot.core.pipeline.process_stage.method.agent_sub_stages.image_input",  # 4.28.x
-    )
-    for module_name in candidate_modules:
-        try:
-            module = import_module(module_name)
-        except Exception:
-            continue
-        prepare = getattr(module, "prepare_request_images", None)
-        if prepare is None:
-            continue
-        try:
-            source = inspect.getsource(prepare)
-        except (OSError, TypeError):
-            continue
-        lowered = source.lower()
-        if "<system_notice>" in lowered and "montage" in lowered:
-            return True
-    return False
 
 
 def _temp_output_path(suffix: str) -> str:
@@ -206,47 +114,6 @@ def _temp_output_path(suffix: str) -> str:
     fd, name = tempfile.mkstemp(prefix="media_montage_", suffix=suffix, dir=str(base))
     os.close(fd)
     return name
-
-
-def _ref_to_local_path(ref: object) -> str | None:
-    """把本地路径 / file:// 引用转成真实文件路径；网络与 base64 引用返回 None。"""
-    if not isinstance(ref, str) or not ref:
-        return None
-    if ref.startswith("file://"):
-        try:
-            from astrbot.core.utils.media_utils import file_uri_to_path
-
-            path = file_uri_to_path(ref)
-        except Exception:
-            from urllib.parse import unquote, urlparse
-
-            path = unquote(urlparse(ref).path)
-            if os.name == "nt" and re.match(r"^/[A-Za-z]:", path):
-                path = path[1:]
-        try:
-            return path if os.path.isfile(path) else None
-        except OSError:
-            return None
-    if ref.startswith(("http://", "https://", "base64://", "data:")):
-        return None
-    try:
-        return ref if os.path.isfile(ref) else None
-    except OSError:
-        return None
-
-
-def _count_frames_from_bytes(data: bytes) -> int:
-    from PIL import Image as PILImage
-
-    with PILImage.open(io.BytesIO(data)) as image:
-        return int(getattr(image, "n_frames", 1) or 1)
-
-
-def _count_frames_from_path(path: str) -> int:
-    from PIL import Image as PILImage
-
-    with PILImage.open(path) as image:
-        return int(getattr(image, "n_frames", 1) or 1)
 
 
 # ---------------------------------------------------------------------------
@@ -334,8 +201,8 @@ def _compose_montage(
 @register(
     PLUGIN_NAME,
     "WorkBuddy",
-    "为 4.28.1/4.28.2 补回动图拼图的模型提示；并让视频也以抽帧拼图的方式被模型理解。",
-    "1.1.0",
+    "AstrBot 4.29+ 专版：让视频以抽帧拼图的方式被模型看懂（零注入，只用官方钩子）。",
+    "1.0.0",
 )
 class MediaMontagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -343,17 +210,11 @@ class MediaMontagePlugin(Star):
         self.config = config or {}
 
         # --- 配置 ---
-        self.enable_gif_notice: bool = _as_bool(
-            self.config.get("enable_gif_notice", True)
-        )
         self.enable_video_montage: bool = _as_bool(
             self.config.get("enable_video_montage", True)
         )
         self.enable_video_notice: bool = _as_bool(
             self.config.get("enable_video_notice", True)
-        )
-        self.gif_notice_text: str = str(
-            self.config.get("gif_notice_text") or DEFAULT_GIF_NOTICE
         )
         self.video_notice_text: str = str(
             self.config.get("video_notice_text") or DEFAULT_VIDEO_NOTICE
@@ -375,161 +236,50 @@ class MediaMontagePlugin(Star):
             self.config.get("video_extract_timeout", 30), 30, 1, 600
         )
 
-        # --- 版本门控 ---
+        # --- 版本要求 ---
         self.version = _get_astrbot_version()
         self.version_tuple = _version_tuple(self.version)
-        self.gif_fix_supported = self.version_tuple in GIF_FIX_VERSIONS
-        # 官方修复若已合入（例如某些 4.28.1 之后的分支构建），插件让位。
-        self.core_fix_present = _core_already_reports_montage()
-        self.gif_notice_active = (
-            self.gif_fix_supported and self.enable_gif_notice and not self.core_fix_present
-        )
+        self.version_ok = self.version_tuple >= MIN_ASTRBOT_VERSION
 
-        self._patched: list[tuple[object, str, object]] = []
-        self._apply_prepare_model_image_patch()
+        if not self.version_ok:
+            logger.warning(
+                "[media_montage_429] 需要 AstrBot >= %s，当前为 %s，插件保持停用。",
+                ".".join(map(str, MIN_ASTRBOT_VERSION)),
+                self.version or "未知",
+            )
 
         logger.info(
-            "[media_montage] loaded. astrbot=%s, gif_notice=%s "
-            "(supported=%s, core_fix=%s, active=%s), "
+            "[media_montage_429] loaded. astrbot=%s, version_ok=%s, "
             "video_montage=%s (grid=%dx%d, frames=%d)",
             self.version or "unknown",
-            self.enable_gif_notice,
-            self.gif_fix_supported,
-            self.core_fix_present,
-            self.gif_notice_active,
+            self.version_ok,
             self.enable_video_montage,
             self.video_grid,
             self.video_grid,
             self.video_frames,
         )
 
-    async def initialize(self) -> None:
-        # initialize() 在实例化之后被调用；这里再确保一次补丁已生效。
-        self._apply_prepare_model_image_patch()
-
     async def terminate(self) -> None:
-        self._remove_prepare_model_image_patch()
-
-    # ------------------------------------------------------------------
-    # prepare_model_image 包装：精确判断本轮是否生成了动图拼图
-    # ------------------------------------------------------------------
-    def _apply_prepare_model_image_patch(self) -> None:
-        if not self.gif_notice_active:
-            return
-
-        target_modules: list[object] = []
-        try:
-            import astrbot.core.utils.media_utils as media_utils
-
-            target_modules.append(media_utils)
-        except Exception as exc:
-            logger.warning("[media_montage] 无法导入 media_utils: %s", exc)
-            return
-        try:
-            # 4.29+ 的 image_input 在 utils 下；4.28.x 在 agent_sub_stages 下。
-            import astrbot.core.utils.image_input as image_input_new
-
-            target_modules.append(image_input_new)
-        except Exception:
-            pass
-        try:
-            from astrbot.core.pipeline.process_stage.method.agent_sub_stages import (
-                image_input,
-            )
-
-            if image_input not in target_modules:
-                target_modules.append(image_input)
-        except Exception:
-            pass
-
-        original = getattr(target_modules[0], "prepare_model_image", None)
-        if original is None:
-            logger.info(
-                "[media_montage] 当前版本没有 prepare_model_image，跳过动图提示补丁。"
-            )
-            return
-        if getattr(original, _WRAP_MARK, False):
-            return  # 已经打过补丁（例如 initialize 被重复调用）
-
-        plugin = self
-
-        async def wrapped_prepare_model_image(image_ref, *args, **kwargs):
-            result = await original(image_ref, *args, **kwargs)
-            try:
-                if result:
-                    produced = result[0] if isinstance(result, (tuple, list)) else result
-                    if isinstance(produced, str) and await plugin._ref_is_animated(
-                        image_ref
-                    ):
-                        _MONTAGE_PATHS.mark(produced)
-            except Exception as exc:  # 探测失败绝不能影响主流程
-                logger.debug("[media_montage] montage probe failed: %s", exc)
-            return result
-
-        setattr(wrapped_prepare_model_image, _WRAP_MARK, True)
-        setattr(wrapped_prepare_model_image, "__wrapped__", original)
-
-        for module in target_modules:
-            if getattr(module, "prepare_model_image", None) is original:
-                setattr(module, "prepare_model_image", wrapped_prepare_model_image)
-                self._patched.append((module, "prepare_model_image", original))
-
-    def _remove_prepare_model_image_patch(self) -> None:
-        for module, attr, original in self._patched:
-            current = getattr(module, attr, None)
-            if current is not None and getattr(current, _WRAP_MARK, False):
-                setattr(module, attr, original)
-        self._patched.clear()
-
-    async def _ref_is_animated(self, ref: object) -> bool:
-        """判断某个图片引用是否为多帧（动图）。
-
-        与核心 `prepare_model_image` 的判定保持一致：帧数 > 1 即走拼图分支。
-        """
-        local = _ref_to_local_path(ref)
-        if local is not None:
-            frames = await asyncio.to_thread(_count_frames_safe, local)
-            return frames > 1
-        # 非本地引用（少数插件会直接塞 URL）：交给 MediaResolver 落地后再数帧。
-        try:
-            from astrbot.core.utils.media_utils import MediaResolver
-
-            async with MediaResolver(str(ref), media_type="image").as_path() as source:
-                data = await asyncio.to_thread(source.read_bytes)
-            frames = await asyncio.to_thread(_count_frames_bytes_safe, data)
-            return frames > 1
-        except Exception:
-            return False
+        # 零注入：没有任何核心函数包装需要还原。
+        return
 
     # ------------------------------------------------------------------
     # LLM 请求钩子
     # ------------------------------------------------------------------
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req) -> None:
-        """在请求装配完成后，补上动图提示，并把视频抽帧拼图塞进请求。"""
-        parts: list[str] = []
-
-        # 1) 动图（官方漏掉提示的那部分）：仅 4.28.1 / 4.28.2 且核心尚未自带提示
-        if self.gif_notice_active:
-            try:
-                if self._request_has_montage(req):
-                    parts.append(self.gif_notice_text)
-            except Exception as exc:
-                logger.debug("[media_montage] gif notice check failed: %s", exc)
-
-        # 2) 视频抽帧拼图：所有版本
-        if self.enable_video_montage:
-            try:
-                converted = await self._attach_video_montages(req, event)
-                if converted and self.enable_video_notice:
-                    parts.append(self._video_notice_body(converted))
-            except Exception as exc:
-                logger.warning(
-                    "[media_montage] video montage failed: %s", exc, exc_info=True
-                )
-
-        if parts:
-            self._append_notice(req, parts)
+        """把本轮请求里的视频转成抽帧拼图并塞进请求。"""
+        if not self.version_ok or not self.enable_video_montage:
+            return
+        try:
+            converted = await self._attach_video_montages(req, event)
+        except Exception as exc:
+            logger.warning(
+                "[media_montage_429] video montage failed: %s", exc, exc_info=True
+            )
+            return
+        if converted and self.enable_video_notice:
+            self._append_notice(req, self._video_notice_body(converted))
 
     def _video_notice_body(self, converted_names: list[str]) -> str:
         """视频提示正文：固定文案 + 官方标签里的视频名（便于模型对应）。"""
@@ -539,26 +289,19 @@ class MediaMontagePlugin(Star):
             body += "\nConverted videos: " + ", ".join(names) + "."
         return body
 
-    def _request_has_montage(self, req) -> bool:
-        urls = getattr(req, "image_urls", None) or []
-        return any(_MONTAGE_PATHS.contains(url) for url in urls)
-
-    def _append_notice(self, req, bodies: list[str]) -> None:
+    def _append_notice(self, req, body: str) -> None:
         """把提示追加到 req.extra_user_content_parts，并标记为临时内容。"""
         try:
             from astrbot.core.agent.message import TextPart
         except Exception:
-            try:
-                from astrbot.api.message_components import Plain as TextPart  # type: ignore
-            except Exception:
-                logger.warning("[media_montage] 无法构造 TextPart，跳过提示。")
-                return
+            logger.warning("[media_montage_429] 无法构造 TextPart，跳过提示。")
+            return
 
-        text = "<system_notice>\n" + "\n".join(bodies) + "\n</system_notice>"
+        text = "<system_notice>\n" + body + "\n</system_notice>"
         try:
             part = TextPart(text=text)
         except Exception:
-            logger.warning("[media_montage] 构造提示失败。")
+            logger.warning("[media_montage_429] 构造提示失败。")
             return
 
         marker = getattr(part, "mark_as_temp", None)
@@ -582,13 +325,12 @@ class MediaMontagePlugin(Star):
         """把本轮请求里的视频转成抽帧拼图并塞进 req.image_urls。
 
         Returns:
-            被转换的视频名列表（取自官方标签或文件名），空列表表示没有转换。
+            被转换的视频名列表（取自官方标签），空列表表示没有转换。
 
-        4.29+ 的官方写法：核心在钩子之前已经把每个视频落地为本地文件，
+        只信官方标签：4.29+ 的核心在钩子之前已经把每个视频落地为本地文件，
         并以 ``[Video Attachment: name X, path Y]`` 标签写进
-        ``req.extra_user_content_parts``。插件优先解析这些标签、直接复用
-        官方解析结果；标签缺失（老版本核心 / 非标准流程）时才回退到自己
-        遍历消息链。拼图路径追加进 ``req.image_urls`` 后，由钩子之后的
+        ``req.extra_user_content_parts``。插件解析这些标签拿到路径后抽帧；
+        拼图路径追加进 ``req.image_urls`` 后，由钩子之后的
         ``prepare_request_images`` 统一完成准备与标注，与官方图片一致。
         """
         urls = getattr(req, "image_urls", None)
@@ -596,8 +338,6 @@ class MediaMontagePlugin(Star):
             return []
 
         entries = _collect_official_video_refs(req)
-        if not entries:
-            entries = await _collect_video_refs_fallback(event)
         if not entries:
             return []
 
@@ -625,7 +365,9 @@ class MediaMontagePlugin(Star):
                 existing.add(montage_path)
                 added_names.append(name or os.path.basename(video_path))
                 logger.info(
-                    "[media_montage] 视频已转拼图: %s <- %s", montage_path, video_path
+                    "[media_montage_429] 视频已转拼图: %s <- %s",
+                    montage_path,
+                    video_path,
                 )
 
         return added_names
@@ -633,7 +375,9 @@ class MediaMontagePlugin(Star):
     async def _build_video_montage(self, video_path: str) -> str | None:
         frames = await self._extract_video_frames(video_path)
         if not frames:
-            logger.warning("[media_montage] 未能从视频抽到帧: %s", video_path)
+            logger.warning(
+                "[media_montage_429] 未能从视频抽到帧: %s", video_path
+            )
             return None
         try:
             data = await asyncio.to_thread(
@@ -644,7 +388,7 @@ class MediaMontagePlugin(Star):
                 self.video_quality,
             )
         except Exception as exc:
-            logger.warning("[media_montage] 视频拼图合成失败: %s", exc)
+            logger.warning("[media_montage_429] 视频拼图合成失败: %s", exc)
             return None
         if not data:
             return None
@@ -652,7 +396,7 @@ class MediaMontagePlugin(Star):
         try:
             await asyncio.to_thread(Path(path).write_bytes, data)
         except OSError as exc:
-            logger.warning("[media_montage] 拼图写入失败: %s", exc)
+            logger.warning("[media_montage_429] 拼图写入失败: %s", exc)
             return None
         return path
 
@@ -703,7 +447,7 @@ class MediaMontagePlugin(Star):
                 )
             except FileNotFoundError:
                 logger.error(
-                    "[media_montage] 未找到 ffmpeg，无法对视频抽帧。"
+                    "[media_montage_429] 未找到 ffmpeg，无法对视频抽帧。"
                     "请安装 ffmpeg 并确保在 PATH 中。"
                 )
                 return []
@@ -718,7 +462,7 @@ class MediaMontagePlugin(Star):
                 except Exception:
                     pass
                 logger.warning(
-                    "[media_montage] 视频抽帧超时（%ss）: %s",
+                    "[media_montage_429] 视频抽帧超时（%ss）: %s",
                     self.video_timeout,
                     video_path,
                 )
@@ -726,7 +470,7 @@ class MediaMontagePlugin(Star):
 
             if process.returncode != 0:
                 message = (stderr or b"").decode(errors="ignore").strip()
-                logger.warning("[media_montage] ffmpeg 抽帧失败: %s", message)
+                logger.warning("[media_montage_429] ffmpeg 抽帧失败: %s", message)
                 return []
 
             files = sorted(Path(temp_dir).glob("frame_*.png"))
@@ -785,17 +529,14 @@ class MediaMontagePlugin(Star):
     async def montage_status(self, event: AstrMessageEvent):
         """查看媒体拼图插件状态（仅管理员）。"""
         lines = [
-            f"插件: {PLUGIN_NAME} v1.1.0",
+            f"插件: {PLUGIN_NAME} v1.0.0",
             f"AstrBot 版本: {self.version or '未知'} -> {'.'.join(map(str, self.version_tuple))}",
-            f"动图提示补丁: {'启用' if self.gif_notice_active else '未生效'}"
-            f"（版本支持: {'是' if self.gif_fix_supported else '否'}, "
-            f"官方已修复: {'是' if self.core_fix_present else '否'}, "
-            f"开关: {'开' if self.enable_gif_notice else '关'}）",
-            f"已挂钩模块: {', '.join(getattr(m, '__name__', str(m)) for m, _, _ in self._patched) or '无'}",
+            f"版本要求 (>= {MIN_ASTRBOT_VERSION[0]}.{MIN_ASTRBOT_VERSION[1]}.{MIN_ASTRBOT_VERSION[2]}): "
+            f"{'满足' if self.version_ok else '不满足（插件停用）'}",
+            f"核心函数注入: 无（零注入，只用官方钩子）",
             f"视频抽帧拼图: {'启用' if self.enable_video_montage else '关闭'}"
             f"（{self.video_grid}x{self.video_grid} / {self.video_frames} 帧 / 最长边 {self.video_max_size}px）",
-            f"视频解析来源: {'官方 [Video Attachment] 标签优先，消息链兜底' if self.version_tuple >= (4, 29, 0) else '消息链解析'}",
-            f"已记录拼图数: {len(_MONTAGE_PATHS)}",
+            f"视频解析来源: 官方 [Video Attachment] 标签",
         ]
         yield event.plain_result("\n".join(lines))
 
@@ -803,18 +544,28 @@ class MediaMontagePlugin(Star):
 # ---------------------------------------------------------------------------
 # 模块级工具
 # ---------------------------------------------------------------------------
-def _count_frames_safe(path: str) -> int:
-    try:
-        return _count_frames_from_path(path)
-    except Exception:
-        return 1
+def _collect_official_video_refs(req) -> list[tuple[str, str]]:
+    """从核心写好的官方标签里收集 (视频名, 本地路径)。
 
+    4.29+ 的核心在 on_llm_request 钩子之前就完成了视频解析
+    （astr_main_agent._append_video_attachment），标签形如::
 
-def _count_frames_bytes_safe(data: bytes) -> int:
-    try:
-        return _count_frames_from_bytes(data)
-    except Exception:
-        return 1
+        [Video Attachment: name xxx.mp4, path /tmp/xxx.mp4]
+        [Video Attachment in quoted message: name xxx.mp4, path /tmp/xxx.mp4]
+
+    引用视频无法落地时核心只保留 ``ref`` 而不是 ``path``，这类标签不会被
+    匹配（插件无法对未落地视频抽帧），属于预期行为。
+    """
+    parts = getattr(req, "extra_user_content_parts", None) or []
+    found: list[tuple[str, str]] = []
+    for part in parts:
+        text = getattr(part, "text", None)
+        if not isinstance(text, str):
+            continue
+        match = _OFFICIAL_VIDEO_LABEL_RE.match(text.strip())
+        if match:
+            found.append((match.group("name").strip(), match.group("path").strip()))
+    return found
 
 
 def _as_bool(value: object, default: bool = False) -> bool:
@@ -833,57 +584,6 @@ def _as_int(value: object, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, parsed))
-
-
-def _collect_video_components(event) -> list:
-    """收集消息本体与引用消息里的视频组件。"""
-    if Video is None:
-        return []
-    message = getattr(getattr(event, "message_obj", None), "message", None) or []
-    found: list = []
-    for comp in message:
-        if isinstance(comp, Video):
-            found.append(comp)
-        elif Reply is not None and isinstance(comp, Reply):
-            for sub in getattr(comp, "chain", None) or []:
-                if isinstance(sub, Video):
-                    found.append(sub)
-    return found
-
-
-def _collect_official_video_refs(req) -> list[tuple[str, str]]:
-    """从核心写好的官方标签里收集 (视频名, 本地路径)。
-
-    4.29+ 的核心在 on_llm_request 钩子之前就完成了视频解析
-    （astr_main_agent._append_video_attachment），标签形如::
-
-        [Video Attachment: name xxx.mp4, path /tmp/xxx.mp4]
-        [Video Attachment in quoted message: name xxx.mp4, path /tmp/xxx.mp4]
-    """
-    parts = getattr(req, "extra_user_content_parts", None) or []
-    found: list[tuple[str, str]] = []
-    for part in parts:
-        text = getattr(part, "text", None)
-        if not isinstance(text, str):
-            continue
-        match = _OFFICIAL_VIDEO_LABEL_RE.match(text.strip())
-        if match:
-            found.append((match.group("name").strip(), match.group("path").strip()))
-    return found
-
-
-async def _collect_video_refs_fallback(event) -> list[tuple[str, str]]:
-    """兜底：老版本核心不写官方标签，自己遍历消息链解析视频组件。"""
-    refs: list[tuple[str, str]] = []
-    for comp in _collect_video_components(event):
-        try:
-            video_path = await comp.convert_to_file_path()
-        except Exception as exc:
-            logger.warning("[media_montage] 视频落地失败，跳过: %s", exc)
-            continue
-        if video_path:
-            refs.append((os.path.basename(video_path), video_path))
-    return refs
 
 
 def _remove_tree(path: str) -> None:

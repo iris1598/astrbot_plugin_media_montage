@@ -1,33 +1,21 @@
 {
-  "enable_gif_notice": {
-    "description": "启用动图拼图提示补丁",
-    "type": "bool",
-    "default": true,
-    "hint": "AstrBot 4.28.1 / 4.28.2 会把动图转成抽帧拼图，但没有告诉模型这是一张动图，导致模型把拼图当成静态图来理解。开启后插件补回这条提示。其他 AstrBot 版本该开关自动失效。"
-  },
-  "gif_notice_text": {
-    "description": "动图提示内容",
-    "type": "text",
-    "default": "The input includes a GIF converted into a single image with frames in reading order. Treat it as an animation; do not mention the conversion or frame layout.",
-    "hint": "会被包裹在 <system_notice> ... </system_notice> 中，作为本轮临时提示追加给模型（不写入会话历史）。默认值与官方修复一致。"
-  },
   "enable_video_montage": {
     "description": "启用视频抽帧拼图",
     "type": "bool",
     "default": true,
-    "hint": "消息中的视频会用 ffmpeg 等间隔抽帧，并按与动图完全相同的 3x3 拼图逻辑合成一张图片交给模型。所有 AstrBot 版本生效，需要系统安装 ffmpeg。"
+    "hint": "消息中的视频会用 ffmpeg 等间隔抽帧，并按与动图完全相同的 3x3 拼图逻辑合成一张图片交给模型。需要系统安装 ffmpeg。"
   },
   "enable_video_notice": {
     "description": "为视频拼图附加提示",
     "type": "bool",
     "default": true,
-    "hint": "告诉模型这张图是视频抽帧拼图，帧按阅读顺序排列。"
+    "hint": "告诉模型这张图是视频抽帧拼图，帧按阅读顺序排列，并列出被转换的视频名。"
   },
   "video_notice_text": {
     "description": "视频提示内容",
     "type": "text",
     "default": "The input includes a video converted into a single image with frames in reading order. Treat this image as a sequence of video frames; do not mention the conversion or frame layout.",
-    "hint": "与动图提示同一容器，会包裹在 <system_notice> ... </system_notice> 中。"
+    "hint": "会包裹在 <system_notice> ... </system_notice> 中，作为本轮临时提示追加给模型（不写入会话历史）。"
   },
   "video_grid": {
     "description": "视频拼图网格边长",

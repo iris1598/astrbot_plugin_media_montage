@@ -1,65 +1,38 @@
-# astrbot_plugin_media_montage
+# astrbot_plugin_media_montage_429
 
-把「动图抽帧拼图」这件事做完整：既补回官方漏掉的提示，也让视频走同一条链路。
+AstrBot **4.29+ 专版**的「视频抽帧拼图」插件。零注入、零核心修改，只用官方钩子。
+
+## 与通用版（astrbot_plugin_media_montage）的区别
+
+| | 通用版 | 本专版 |
+| --- | --- | --- |
+| 适配版本 | 4.28.x ~ 4.29+ | **仅 4.29+**（加载时校验） |
+| 动图拼图提示补丁 | 有（仅 4.28.1/4.28.2） | **无**（官方修复已接管） |
+| 核心函数包装（注入） | 有（仅在 4.28.x 生效） | **无，任何情况下都不修改核心** |
+| 视频解析 | 官方标签优先 + 消息链兜底 | **只解析官方标签** |
+| 配置项 | 10 项 | 8 项（剔除动图相关） |
+
+二选一安装即可；两者同时安装也不冲突（插件名不同），但功能会重复。
 
 ## 它解决什么问题
 
-AstrBot 从 **4.28.1** 起，内置 Agent 会把消息里的动图（GIF / APNG / 动态 WebP）
-转成一张 **3×3 的抽帧拼图** 再交给模型 —— 因为绝大多数模型接口不接受动图。
-
-问题在于：**拼图是一张静态图，模型并不知道它是动图。** 于是模型会把九宫格
-当成「一张奇怪的图」或「九张并排的图」，经常答非所问。
-
-官方修复（就是那个 `prepare_model_image` 返回 `(path, is_montage)` 的补丁）
-会额外追加一条临时提示告诉模型：
-
-```
-<system_notice>
-The input includes a GIF converted into a single image with frames in reading order.
-Treat it as an animation; do not mention the conversion or frame layout.
-</system_notice>
-```
-
-**但这个修复没有进入 4.28.1 和 4.28.2 的发行版**（`4.28.2` 的更新日志只有
-SQLite 时间字段相关修复）。本插件用插件的形式把它补回来。
-
-顺带解决第二件事：**视频目前对模型完全不可见**。核心只会往请求里塞一行
+AstrBot 4.29 里，消息中的视频对模型只是一行文本
 `[Video Attachment: name xxx.mp4, path /tmp/xxx.mp4]`，模型看不到任何画面。
-本插件用 ffmpeg 对视频等间隔抽帧，套用**与动图完全相同的 3×3 拼图逻辑**
-合成一张图，追加进 `req.image_urls`，并附上同样的提示。
 
-自 v1.1.0 起，视频解析对齐 AstrBot 4.29 的官方新写法：核心在 `on_llm_request`
-钩子之前就把视频落地为本地文件并写入 `[Video Attachment: ...]` 标签，
-插件直接复用这份解析结果（不再重复解析消息链）；老版本核心无标签时才回退为
-自己遍历消息链。提示按官方 montage notice 风格构造，并附上被转换的视频名，
-便于模型把拼图与 `[Video Attachment]` 标签对应起来。
-
-## 生效范围
-
-| 能力 | 生效版本 |
-| --- | --- |
-| 动图拼图提示补丁 | **仅** AstrBot `4.28.1` / `4.28.2` |
-| 视频抽帧拼图 | **所有** AstrBot 版本 |
-
-- 为什么限制动图提示的版本？< 4.28.1 根本没有拼图机制，加提示会误导模型；
-  > 4.28.2 应当由官方修复接管，插件主动让位，避免重复提示。
-- **额外兜底：核心已修复时自动让位。** 插件加载时会检查
-  `prepare_request_images` 的源码里是否已经出现拼图标记与 `<system_notice>`
-  （同时兼容 4.28.x 的 `agent_sub_stages.image_input` 与 4.29+ 重构后的
-  `astrbot.core.utils.image_input` 两种模块布局）。若已出现（例如某些基于 4.28.1 的、
-  已经带上官方修复的分支构建，或者官方把修复合回了 4.28.x / 4.29+），
-  插件会跳过动图补丁，避免同一条提示被发两遍。
-  这个状态可以用 `/montage_status` 查看（`官方已修复: 是/否`）。
-- 视频抽帧不依赖核心的拼图机制（插件自己抽帧、自己合成），因此不设版本限制，
-  也**不受上面这两个开关影响**。
+核心在 `on_llm_request` 钩子**之前**就把视频落地为本地文件并写入这个官方标签。
+本插件解析这些标签，用 ffmpeg 对视频等间隔抽帧，套用与官方动图完全相同的
+**3×3 拼图逻辑**合成一张图，追加进 `req.image_urls`；钩子之后核心的
+`prepare_request_images` 统一完成图片准备与标注。插件再按官方 montage notice
+的风格附加一条 `<system_notice>`（临时内容，不写入会话历史），并附上被转换的
+视频名，让模型能把拼图和 `[Video Attachment]` 标签对应起来。
 
 ## 安装
 
-1. 把整个 `astrbot_plugin_media_montage` 目录放进 `AstrBot/data/plugins/`。
+1. 把整个 `astrbot_plugin_media_montage_429` 目录放进 `AstrBot/data/plugins/`。
 2. 在 WebUI「插件」页面点击插件卡片的刷新（重载）图标。
 3. 依赖：`Pillow`（AstrBot 自带）。视频抽帧需要系统安装 **ffmpeg** 并在 PATH 中
    —— AstrBot 自身的视频格式转换本来也依赖它。
-4. 动图提示补丁是进程级的函数包装，**改动代码后必须重载插件**才能生效/撤销。
+4. 版本不满足（< 4.29.0）时插件会自动停用并在日志里给出明确提示。
 
 ## 配置
 
@@ -67,10 +40,9 @@ WebUI 插件配置页可调，详见 `_conf_schema.json`。常用项：
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `enable_gif_notice` | `true` | 动图提示补丁开关（仅 4.28.1/4.28.2 有效） |
-| `gif_notice_text` | 官方文案 | 提示正文，会包在 `<system_notice>` 里 |
 | `enable_video_montage` | `true` | 视频抽帧拼图开关 |
 | `enable_video_notice` | `true` | 视频拼图是否附加提示 |
+| `video_notice_text` | 官方风格文案 | 提示正文，会包在 `<system_notice>` 里 |
 | `video_grid` | `3` | 拼图网格边长，默认与动图一致的 3×3 |
 | `video_frames` | `0` | 0 = 自动（网格边长²），默认 9 帧 |
 | `video_max_size` | `1280` | 拼图最长边，只缩不放 |
@@ -79,34 +51,23 @@ WebUI 插件配置页可调，详见 `_conf_schema.json`。常用项：
 
 ## 诊断
 
-管理员发送 `/montage_status`，会输出当前 AstrBot 版本、动图补丁是否生效、
-已挂钩的模块、视频拼图参数，以及已记录的拼图数量。用来快速确认版本门控是否符合预期。
+管理员发送 `/montage_status`，会输出当前 AstrBot 版本是否满足要求、
+视频拼图参数与解析来源。
 
 ## 实现要点
 
-1. **精确判断「本轮到底有没有生成拼图」**：核心在
-   `image_input.prepare_request_images()` 里调用 `media_utils.prepare_model_image()`，
-   只有帧数 > 1 才走拼图分支。插件在加载时包装该函数
-   （`media_utils` 和 `image_input` 两处绑定都要替换），记录
-   `产出路径 → 是否为拼图`；钩子里只需检查 `req.image_urls` 是否命中记录，
-   与官方补丁的 `has_montage` 语义完全一致 —— 包括缓存命中的拼图。
-2. **视频复用同一套拼图参数**：3×3 网格、白底、帧按阅读顺序、逐格 `LANCZOS`
-   缩放、整体最长边不超过 `max_size`，与核心 `_extract_animation_montage_sync` 同构。
-3. **提示的生命周期与官方一致**：通过 `TextPart(...).mark_as_temp()` 标记为
-   本轮临时内容，不写入会话历史（旧版本无此 API 时自动降级）。
-4. **插件在钩子里追加的图片会被核心二次处理**：核心在 `on_llm_request` 之后
-   还会再跑一次图片准备（4.29+ 为 `astrbot.core.utils.image_input.prepare_request_images`），
-   所以插件只需把拼图路径塞进 `req.image_urls`，
-   缩放/编码/上传策略仍由核心统一负责。
-5. **视频解析优先复用官方结果（4.29+）**：核心在钩子前已把视频落地并写入
-   `[Video Attachment: name X, path Y]` 标签，插件解析这些标签拿到路径后直接抽帧，
-   不再重复调用 `convert_to_file_path()`；标签缺失（老版本核心）时回退为
-   遍历消息链解析视频组件。视频提示通过 `TextPart(...).mark_as_temp()` 标记为
-   本轮临时内容，并附上被转换的视频名。
-6. **失败绝不打断主流程**：抽帧、合成、探测全部包在 try/except 中，
+1. **零注入**：不 import、不包装、不替换核心的任何函数；唯一的介入点是
+   官方 `on_llm_request` 钩子，随插件卸载即完全还原。
+2. **只信官方标签**：视频来源唯一途径是核心写好的
+   `[Video Attachment: name X, path Y]` 标签；引用视频无法落地时核心只保留
+   `ref`（无 `path`），该标签不会被匹配，插件跳过——属于预期行为。
+3. **拼图与官方动图同构**：3×3 网格、白底、帧按阅读顺序、逐格 `LANCZOS`
+   缩放、整体最长边不超过 `max_size`。
+4. **提示的生命周期与官方一致**：`TextPart(...).mark_as_temp()` 标记为
+   本轮临时内容，不写入会话历史。
+5. **失败绝不打断主流程**：抽帧、合成、探测全部包在 try/except 中，
    任何一步失败都只是退化为原有行为（视频对模型不可见）。
 
 ## 许可
 
 AGPL-3.0-or-later（与 AstrBot 本体一致）。
-提示文案 `gif_notice_text` 的默认值取自 AstrBot 官方修复的实现。
