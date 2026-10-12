@@ -15,6 +15,11 @@
     模型看不到画面。本插件用 ffmpeg 对视频等间隔抽帧，然后套用与动图**完全相同**
     的 3x3 拼图逻辑合成一张图片，追加到 req.image_urls 里，并附带同样的提示。
 
+    4.29+ 的官方写法：核心在 on_llm_request 钩子之前就把视频落地为本地文件，
+    并以 "[Video Attachment: name X, path Y]" 标签写进 req.extra_user_content_parts。
+    插件优先解析这些官方标签、直接复用核心的解析结果；标签缺失时（老版本核心）
+    才回退为遍历消息链解析视频组件。
+
 设计要点
 --------
 1. 精确探测"这一轮到底有没有生成拼图"：
@@ -81,6 +86,13 @@ DEFAULT_VIDEO_NOTICE = (
     "do not mention the conversion or frame layout."
 )
 
+# 4.29+ 核心在 on_llm_request 钩子之前就把视频解析成这种官方标签
+# （astr_main_agent._append_video_attachment）。插件直接复用其解析结果。
+_OFFICIAL_VIDEO_LABEL_RE = re.compile(
+    r"^\[Video Attachment(?: in quoted message)?: "
+    r"name (?P<name>.+?), path (?P<path>.+)\]$"
+)
+
 _WRAP_MARK = "__media_montage_wrapped__"
 _PATCH_MODULE_ATTR = "_media_montage_original"
 
@@ -139,20 +151,43 @@ def _version_tuple(version: str) -> tuple[int, int, int]:
 def _core_already_reports_montage() -> bool:
     """检测核心是否已经自带"拼图提示"（官方修复已合入）。
 
-    官方修复的特征是 `prepare_request_images` 里出现 ``has_montage`` 与
+    官方修复的特征是 `prepare_request_images` 里出现拼图标记与
     ``<system_notice>``。若已合入，插件让位，避免给模型重复提示。
+
+    兼容两种核心布局：
+    - AstrBot 4.29+：`astrbot.core.utils.image_input`（重构后的新位置）；
+    - AstrBot 4.28.x：`astrbot.core.pipeline.process_stage.method.agent_sub_stages.image_input`。
+
+    特征匹配同时覆盖两个版本的官方实现：4.28 的修复用 ``has_montage``，
+    4.29 重构后改用 ``is_montage`` / "frame montage" 文案，共同点是
+    ``<system_notice>`` 与 "montage" 字样同时出现。
     """
     try:
         import inspect
-
-        from astrbot.core.pipeline.process_stage.method.agent_sub_stages import (
-            image_input,
-        )
-
-        source = inspect.getsource(image_input.prepare_request_images)
-        return "has_montage" in source or "<system_notice>" in source
-    except Exception:
+        from importlib import import_module
+    except Exception:  # pragma: no cover
         return False
+
+    candidate_modules = (
+        "astrbot.core.utils.image_input",  # 4.29+
+        "astrbot.core.pipeline.process_stage.method.agent_sub_stages.image_input",  # 4.28.x
+    )
+    for module_name in candidate_modules:
+        try:
+            module = import_module(module_name)
+        except Exception:
+            continue
+        prepare = getattr(module, "prepare_request_images", None)
+        if prepare is None:
+            continue
+        try:
+            source = inspect.getsource(prepare)
+        except (OSError, TypeError):
+            continue
+        lowered = source.lower()
+        if "<system_notice>" in lowered and "montage" in lowered:
+            return True
+    return False
 
 
 def _temp_output_path(suffix: str) -> str:
@@ -300,7 +335,7 @@ def _compose_montage(
     PLUGIN_NAME,
     "WorkBuddy",
     "为 4.28.1/4.28.2 补回动图拼图的模型提示；并让视频也以抽帧拼图的方式被模型理解。",
-    "1.0.0",
+    "1.1.0",
 )
 class MediaMontagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -391,11 +426,19 @@ class MediaMontagePlugin(Star):
             logger.warning("[media_montage] 无法导入 media_utils: %s", exc)
             return
         try:
+            # 4.29+ 的 image_input 在 utils 下；4.28.x 在 agent_sub_stages 下。
+            import astrbot.core.utils.image_input as image_input_new
+
+            target_modules.append(image_input_new)
+        except Exception:
+            pass
+        try:
             from astrbot.core.pipeline.process_stage.method.agent_sub_stages import (
                 image_input,
             )
 
-            target_modules.append(image_input)
+            if image_input not in target_modules:
+                target_modules.append(image_input)
         except Exception:
             pass
 
@@ -477,9 +520,9 @@ class MediaMontagePlugin(Star):
         # 2) 视频抽帧拼图：所有版本
         if self.enable_video_montage:
             try:
-                if await self._attach_video_montages(req, event):
-                    if self.enable_video_notice:
-                        parts.append(self.video_notice_text)
+                converted = await self._attach_video_montages(req, event)
+                if converted and self.enable_video_notice:
+                    parts.append(self._video_notice_body(converted))
             except Exception as exc:
                 logger.warning(
                     "[media_montage] video montage failed: %s", exc, exc_info=True
@@ -487,6 +530,14 @@ class MediaMontagePlugin(Star):
 
         if parts:
             self._append_notice(req, parts)
+
+    def _video_notice_body(self, converted_names: list[str]) -> str:
+        """视频提示正文：固定文案 + 官方标签里的视频名（便于模型对应）。"""
+        body = self.video_notice_text
+        names = [name for name in converted_names if name]
+        if names:
+            body += "\nConverted videos: " + ", ".join(names) + "."
+        return body
 
     def _request_has_montage(self, req) -> bool:
         urls = getattr(req, "image_urls", None) or []
@@ -527,31 +578,38 @@ class MediaMontagePlugin(Star):
     # ------------------------------------------------------------------
     # 视频 -> 抽帧 -> 拼图
     # ------------------------------------------------------------------
-    async def _attach_video_montages(self, req, event) -> bool:
-        videos = _collect_video_components(event)
-        if not videos:
-            return False
+    async def _attach_video_montages(self, req, event) -> list[str]:
+        """把本轮请求里的视频转成抽帧拼图并塞进 req.image_urls。
 
+        Returns:
+            被转换的视频名列表（取自官方标签或文件名），空列表表示没有转换。
+
+        4.29+ 的官方写法：核心在钩子之前已经把每个视频落地为本地文件，
+        并以 ``[Video Attachment: name X, path Y]`` 标签写进
+        ``req.extra_user_content_parts``。插件优先解析这些标签、直接复用
+        官方解析结果；标签缺失（老版本核心 / 非标准流程）时才回退到自己
+        遍历消息链。拼图路径追加进 ``req.image_urls`` 后，由钩子之后的
+        ``prepare_request_images`` 统一完成准备与标注，与官方图片一致。
+        """
         urls = getattr(req, "image_urls", None)
         if not isinstance(urls, list):
-            return False
+            return []
 
-        added = False
+        entries = _collect_official_video_refs(req)
+        if not entries:
+            entries = await _collect_video_refs_fallback(event)
+        if not entries:
+            return []
+
+        added_names: list[str] = []
         existing = set(urls)
         cache: dict[str, str | None] = {}
-        for comp in videos:
-            video_path: str | None = None
-            try:
-                video_path = await comp.convert_to_file_path()
-            except Exception as exc:
-                logger.warning("[media_montage] 视频落地失败，跳过: %s", exc)
+        for name, video_path in entries:
+            if not video_path or video_path in cache:
                 continue
-            if not video_path:
-                continue
-
-            if video_path not in cache:
-                cache[video_path] = await self._build_video_montage(video_path)
-            montage_path = cache[video_path]
+            montage_path = cache[video_path] = await self._build_video_montage(
+                video_path
+            )
             if not montage_path:
                 continue
 
@@ -565,10 +623,12 @@ class MediaMontagePlugin(Star):
             if montage_path not in existing:
                 urls.append(montage_path)
                 existing.add(montage_path)
-                added = True
-                logger.info("[media_montage] 视频已转拼图: %s", montage_path)
+                added_names.append(name or os.path.basename(video_path))
+                logger.info(
+                    "[media_montage] 视频已转拼图: %s <- %s", montage_path, video_path
+                )
 
-        return added
+        return added_names
 
     async def _build_video_montage(self, video_path: str) -> str | None:
         frames = await self._extract_video_frames(video_path)
@@ -725,7 +785,7 @@ class MediaMontagePlugin(Star):
     async def montage_status(self, event: AstrMessageEvent):
         """查看媒体拼图插件状态（仅管理员）。"""
         lines = [
-            f"插件: {PLUGIN_NAME}",
+            f"插件: {PLUGIN_NAME} v1.1.0",
             f"AstrBot 版本: {self.version or '未知'} -> {'.'.join(map(str, self.version_tuple))}",
             f"动图提示补丁: {'启用' if self.gif_notice_active else '未生效'}"
             f"（版本支持: {'是' if self.gif_fix_supported else '否'}, "
@@ -734,6 +794,7 @@ class MediaMontagePlugin(Star):
             f"已挂钩模块: {', '.join(getattr(m, '__name__', str(m)) for m, _, _ in self._patched) or '无'}",
             f"视频抽帧拼图: {'启用' if self.enable_video_montage else '关闭'}"
             f"（{self.video_grid}x{self.video_grid} / {self.video_frames} 帧 / 最长边 {self.video_max_size}px）",
+            f"视频解析来源: {'官方 [Video Attachment] 标签优先，消息链兜底' if self.version_tuple >= (4, 29, 0) else '消息链解析'}",
             f"已记录拼图数: {len(_MONTAGE_PATHS)}",
         ]
         yield event.plain_result("\n".join(lines))
@@ -788,6 +849,41 @@ def _collect_video_components(event) -> list:
                 if isinstance(sub, Video):
                     found.append(sub)
     return found
+
+
+def _collect_official_video_refs(req) -> list[tuple[str, str]]:
+    """从核心写好的官方标签里收集 (视频名, 本地路径)。
+
+    4.29+ 的核心在 on_llm_request 钩子之前就完成了视频解析
+    （astr_main_agent._append_video_attachment），标签形如::
+
+        [Video Attachment: name xxx.mp4, path /tmp/xxx.mp4]
+        [Video Attachment in quoted message: name xxx.mp4, path /tmp/xxx.mp4]
+    """
+    parts = getattr(req, "extra_user_content_parts", None) or []
+    found: list[tuple[str, str]] = []
+    for part in parts:
+        text = getattr(part, "text", None)
+        if not isinstance(text, str):
+            continue
+        match = _OFFICIAL_VIDEO_LABEL_RE.match(text.strip())
+        if match:
+            found.append((match.group("name").strip(), match.group("path").strip()))
+    return found
+
+
+async def _collect_video_refs_fallback(event) -> list[tuple[str, str]]:
+    """兜底：老版本核心不写官方标签，自己遍历消息链解析视频组件。"""
+    refs: list[tuple[str, str]] = []
+    for comp in _collect_video_components(event):
+        try:
+            video_path = await comp.convert_to_file_path()
+        except Exception as exc:
+            logger.warning("[media_montage] 视频落地失败，跳过: %s", exc)
+            continue
+        if video_path:
+            refs.append((os.path.basename(video_path), video_path))
+    return refs
 
 
 def _remove_tree(path: str) -> None:

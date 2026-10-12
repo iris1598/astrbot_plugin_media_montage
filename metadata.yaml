@@ -2,7 +2,7 @@ name: astrbot_plugin_media_montage
 display_name: 媒体拼图（动图提示 + 视频抽帧）
 desc: 为 AstrBot 4.28.1/4.28.2 补回"动图被转成抽帧拼图"时给模型的提示；同时让视频也以完全相同的抽帧拼图逻辑被模型理解（所有版本生效）。
 short_desc: 补回动图拼图提示，并让视频也能被"看懂"。
-version: v1.0.0
+version: v1.1.0
 author: Iris1598
 repo: https://github.com/iris1598/astrbot_plugin_media_montage
 # 动图提示补丁只在 4.28.1 / 4.28.2 生效（插件内部自行判定）；

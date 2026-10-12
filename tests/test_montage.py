@@ -38,8 +38,12 @@ sys.path.insert(0, str(ASTROBOT_DIR / "data" / "site-packages"))
 
 from PIL import Image  # noqa: E402
 
-import astrbot.core.pipeline.process_stage.method.agent_sub_stages.image_input as image_input  # noqa: E402
 import astrbot.core.utils.media_utils as media_utils  # noqa: E402
+
+try:  # 4.29+：image_input 移到了 utils 下
+    import astrbot.core.utils.image_input as image_input  # noqa: E402
+except ImportError:  # 4.28.x：还在 agent_sub_stages 下
+    import astrbot.core.pipeline.process_stage.method.agent_sub_stages.image_input as image_input  # noqa: E402,E501
 
 
 def _load_plugin_module():
@@ -83,6 +87,14 @@ class _Req:
     def __init__(self, image_urls=()):
         self.image_urls = list(image_urls)
         self.extra_user_content_parts = []
+
+
+class _ReqWithParts(_Req):
+    """带预置内容块（例如官方 [Video Attachment] 标签）的请求。"""
+
+    def __init__(self, *parts):
+        super().__init__()
+        self.extra_user_content_parts = list(parts)
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -150,11 +162,24 @@ async def main() -> None:
         f"gif_notice_active={plugin.gif_notice_active}"
     )
     check(
-        "插件识别到 4.28.x 版本",
-        plugin.version_tuple in {(4, 28, 1), (4, 28, 2)},
+        "版本门控判定与门控集合一致",
+        plugin.gif_fix_supported
+        is (plugin.version_tuple in mod.GIF_FIX_VERSIONS),
         plugin.version,
     )
-    check("版本属于补丁目标版本", plugin.gif_fix_supported is True)
+    check(
+        "官方修复检测与核心实际状态一致",
+        plugin.core_fix_present is mod._core_already_reports_montage(),
+    )
+    check(
+        "gif_notice_active 与三个门控条件一致",
+        plugin.gif_notice_active
+        is (
+            plugin.gif_fix_supported
+            and plugin.enable_gif_notice
+            and not plugin.core_fix_present
+        ),
+    )
 
     expect_patch = plugin.gif_notice_active
     check(
@@ -302,7 +327,10 @@ async def main() -> None:
                 len(mod._collect_video_components(event)) == 1,
             )
             added = await plugin._attach_video_montages(req, event)
-            check("视频拼图被加入 image_urls", added and len(req.image_urls) == 1)
+            check(
+                "视频拼图被加入 image_urls（消息链兜底路径）",
+                bool(added) and len(req.image_urls) == 1,
+            )
             check("已登记临时文件", len(event.tracked) == 1)
             await plugin.on_llm_request(event, req)
             video_notices = [
@@ -311,6 +339,74 @@ async def main() -> None:
                 if "video" in getattr(p, "text", "")
             ]
             check("视频提示已追加", len(video_notices) == 1, str(len(video_notices)))
+
+            # --- 5b. 4.29+ 官方标签路径 ------------------------------------
+            from astrbot.core.agent.message import TextPart
+
+            check(
+                "官方标签正则匹配普通视频标签",
+                mod._collect_official_video_refs(
+                    _ReqWithParts(
+                        TextPart(
+                            text=f"[Video Attachment: name {video.name}, path {video}]"
+                        )
+                    )
+                )
+                == [(video.name, str(video))],
+            )
+            check(
+                "官方标签正则匹配引用消息视频标签",
+                mod._collect_official_video_refs(
+                    _ReqWithParts(
+                        TextPart(
+                            text=(
+                                "[Video Attachment in quoted message: "
+                                f"name {video.name}, path {video}]"
+                            )
+                        )
+                    )
+                )
+                == [(video.name, str(video))],
+            )
+            check(
+                "官方标签正则不匹配普通文本",
+                mod._collect_official_video_refs(
+                    _ReqWithParts(TextPart(text="[File Attachment: name a, path b]"))
+                )
+                == [],
+            )
+
+            official_req = _ReqWithParts(
+                TextPart(text=f"[Video Attachment: name {video.name}, path {video}]")
+            )
+            official_event = _Event()
+            converted = await plugin._attach_video_montages(official_req, official_event)
+            check(
+                "官方标签路径：视频名被正确返回",
+                converted == [video.name],
+                str(converted),
+            )
+            check(
+                "官方标签路径：拼图被加入 image_urls",
+                len(official_req.image_urls) == 1,
+            )
+            check("官方标签路径：已登记临时文件", len(official_event.tracked) == 1)
+            await plugin.on_llm_request(official_event, official_req)
+            official_notices = [
+                p
+                for p in official_req.extra_user_content_parts
+                if getattr(p, "text", "").startswith("<system_notice>")
+            ]
+            check("官方标签路径：提示已追加", len(official_notices) == 1)
+            if official_notices:
+                check(
+                    "官方标签路径：提示包含视频名",
+                    video.name in official_notices[0].text,
+                )
+                check(
+                    "官方标签路径：提示被标记为临时内容",
+                    official_notices[0]._no_save is True,
+                )
 
     # --- 6. 卸载还原 -------------------------------------------------------
     await plugin.terminate()
