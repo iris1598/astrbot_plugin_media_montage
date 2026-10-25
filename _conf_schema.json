@@ -46,5 +46,12 @@
     "type": "int",
     "default": 30,
     "hint": "视频过大或时长过长时可适当调大，避免抽帧被中断。"
+  },
+  "audio_mode": {
+    "description": "语音处理模式",
+    "type": "string",
+    "default": "off",
+    "options": ["off", "llonebot_stt"],
+    "hint": "off：不处理语音，保持 AstrBot 原有行为。llonebot_stt：仅在 OneBot11（aiocqhttp）适配器下生效，调用 llonebot 5.1+ 扩展的 voice_msg_to_text 接口把语音转成文字交给模型，不发送音频文件；引用消息里的语音也能转写（替换引用占位文本），合并转发内部语音不解析。其他适配器下该模式不触发，保持原有行为。"
   }
 }

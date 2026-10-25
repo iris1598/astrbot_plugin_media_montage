@@ -162,6 +162,261 @@ async def main() -> None:
         str(getattr(hook, "event_type", None)),
     )
 
+    # --- 3.5 OneBot11 语音转文字（自 mimo_media 移植） ----------------------
+    from astrbot.core.agent.message import TextPart
+    from astrbot.core.message.components import Nodes as CoreNodes
+    from astrbot.core.message.components import Node as CoreNode
+    from astrbot.core.message.components import Record as CoreRecord
+    from astrbot.core.message.components import Reply as CoreReply
+
+    class _SttApi:
+        """OneBotClient 走的 bot.api.call_action（get_msg 等）。"""
+
+        def __init__(self, payloads):
+            self.payloads = payloads
+            self.calls = []
+
+        async def call_action(self, action, **params):
+            self.calls.append((action, params))
+            key = str(params.get("message_id") or params.get("id") or "")
+            return self.payloads.get(key)
+
+    class _SttBot:
+        """voice_msg_to_text 走的 bot.call_action（与 mimo_media 相同入口）。"""
+
+        def __init__(self, text="", payloads=None):
+            self.api = _SttApi(payloads or {})
+            self.text = text
+            self.stt_calls = []
+
+        async def call_action(self, **kwargs):
+            self.stt_calls.append(kwargs)
+            return {"status": "ok", "retcode": 0, "data": {"text": self.text}}
+
+    class _SttEvent:
+        def __init__(
+            self, message=(), platform="aiocqhttp", raw_message=None, bot=None
+        ):
+            self.message_obj = _MessageObj(message)
+            self.message_obj.raw_message = raw_message
+            self.message_obj.message_id = None
+            self.platform = platform
+            self.bot = bot
+            self._extras = {}
+
+        def get_platform_name(self):
+            return self.platform
+
+        def get_extra(self, key=None, default=None):
+            return self._extras.get(key, default)
+
+        def set_extra(self, key, value):
+            self._extras[key] = value
+
+    class _SttReq:
+        def __init__(self, audio_urls=(), parts=()):
+            self.audio_urls = list(audio_urls)
+            self.extra_user_content_parts = list(parts)
+
+    stt_plugin = mod.MediaMontagePlugin(
+        context=None,
+        config={"audio_mode": "llonebot_stt", "enable_video_montage": False},
+    )
+    check(
+        "audio_mode 归一化（默认 off / 合法值 / 非法回退 off）",
+        stt_plugin.audio_mode == "llonebot_stt"
+        and mod.MediaMontagePlugin(context=None, config={}).audio_mode == "off"
+        and mod.MediaMontagePlugin(
+            context=None, config={"audio_mode": "bogus"}
+        ).audio_mode
+        == "off",
+    )
+
+    # 直接发送的语音 -> 追加转写文字
+    bot = _SttBot("这是直接语音")
+    event = _SttEvent(
+        [CoreRecord(file="voice.amr")],
+        raw_message={"message_id": 123},
+        bot=bot,
+    )
+    req = _SttReq(
+        audio_urls=["/tmp/voice.silk"],
+        parts=[TextPart(text="[Audio Attachment: path /tmp/voice.silk]")],
+    )
+    await stt_plugin.on_llm_request(event, req)
+    check(
+        "直接语音调用 voice_msg_to_text（参数结构与 mimo_media 一致）",
+        bot.stt_calls == [{"action": "voice_msg_to_text", "message_id": 123}],
+        str(bot.stt_calls),
+    )
+    check(
+        "转写文字追加且音频标签移除、audio_urls 清空",
+        [getattr(p, "text", "") for p in req.extra_user_content_parts]
+        == ["这是直接语音"]
+        and req.audio_urls == [],
+    )
+
+    # 引用消息里的语音 -> 替换 [Empty Text]，用被引用消息 id 转写
+    bot = _SttBot("这是引用语音转写")
+    event = _SttEvent(
+        [CoreReply(id=456, chain=[CoreRecord(file="quote.amr")])],
+        raw_message={"message_id": 999},
+        bot=bot,
+    )
+    req = _SttReq(
+        parts=[
+            TextPart(
+                text="<Quoted Message>\n(某人): [Empty Text]\n</Quoted Message>"
+            ),
+            TextPart(
+                text="[Audio Attachment in quoted message: path /tmp/quote.silk]"
+            ),
+        ]
+    )
+    await stt_plugin.on_llm_request(event, req)
+    check(
+        "引用语音用被引用消息 id 转写",
+        bot.stt_calls == [{"action": "voice_msg_to_text", "message_id": 456}],
+        str(bot.stt_calls),
+    )
+    texts = [getattr(p, "text", "") for p in req.extra_user_content_parts]
+    check(
+        "引用占位 [Empty Text] 被转写文字替换",
+        texts[0] == "<Quoted Message>\n(某人): 这是引用语音转写\n</Quoted Message>",
+        texts[0],
+    )
+    check(
+        "引用语音附件标签被移除",
+        all("Audio Attachment" not in text for text in texts),
+        str(texts),
+    )
+
+    # 仅有 reply id（链内无媒体）-> 先 get_msg 拉原文再转写
+    bot = _SttBot(
+        "远程引用语音",
+        payloads={
+            "321": {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "message": [{"type": "record", "data": {"file": "reply.amr"}}]
+                },
+            }
+        },
+    )
+    event = _SttEvent(
+        [CoreReply(id=321, chain=[])],
+        raw_message={"message_id": 100},
+        bot=bot,
+    )
+    req = _SttReq(
+        parts=[
+            TextPart(text="<Quoted Message>\n(u): [Empty Text]\n</Quoted Message>")
+        ]
+    )
+    await stt_plugin.on_llm_request(event, req)
+    check(
+        "reply-id-only 引用语音经 get_msg 解析后转写",
+        bot.stt_calls == [{"action": "voice_msg_to_text", "message_id": 321}],
+        str(bot.stt_calls),
+    )
+    check(
+        "get_msg 已被调用",
+        bool(bot.api.calls) and bot.api.calls[0][0] == "get_msg",
+        str(bot.api.calls),
+    )
+    check(
+        "远程转写替换占位",
+        "远程引用语音" in getattr(req.extra_user_content_parts[0], "text", ""),
+    )
+
+    # 合并转发内部的语音不收集
+    node = CoreNode(content=[CoreRecord(file="in-forward.amr")])
+    event = _SttEvent(
+        [CoreNodes([node])], raw_message={"message_id": 77}, bot=_SttBot("不应转写")
+    )
+    check(
+        "合并转发内部语音不收集",
+        stt_plugin._collect_audio_targets(event) == [],
+    )
+
+    # 转写失败（空文本）-> 附加失败提示，且不发送音频
+    bot = _SttBot("")
+    event = _SttEvent(
+        [CoreRecord(file="v.amr")], raw_message={"message_id": 9}, bot=bot
+    )
+    req = _SttReq(
+        audio_urls=["/tmp/c.silk"],
+        parts=[TextPart(text="[Audio Attachment: path /tmp/c.silk]")],
+    )
+    await stt_plugin.on_llm_request(event, req)
+    texts = [getattr(p, "text", "") for p in req.extra_user_content_parts]
+    check(
+        "转写失败附加提示且不发送音频",
+        texts == ["[语音转文字失败，已跳过]"] and req.audio_urls == [],
+        str(texts),
+    )
+
+    # 与视频拼图共存：视频官方标签必须保留
+    bot = _SttBot("语音内容")
+    event = _SttEvent(
+        [CoreRecord(file="v.amr")], raw_message={"message_id": 11}, bot=bot
+    )
+    req = _SttReq(
+        parts=[
+            TextPart(text="[Video Attachment: name a.mp4, path /tmp/a.mp4]"),
+            TextPart(text="[Audio Attachment: path /tmp/v.silk]"),
+        ]
+    )
+    await stt_plugin.on_llm_request(event, req)
+    texts = [getattr(p, "text", "") for p in req.extra_user_content_parts]
+    check(
+        "视频官方标签保留、音频标签移除",
+        texts[0].startswith("[Video Attachment:")
+        and all("Audio Attachment" not in text for text in texts),
+        str(texts),
+    )
+
+    # 非 OneBot11 平台：完全不触发，保持原有音频行为
+    bot = _SttBot("不应被调用")
+    event = _SttEvent(
+        [CoreRecord(file="voice.amr")],
+        platform="telegram",
+        raw_message={"message_id": 1},
+        bot=bot,
+    )
+    req = _SttReq(
+        audio_urls=["/tmp/a.silk"],
+        parts=[TextPart(text="[Audio Attachment: path /tmp/a.silk]")],
+    )
+    await stt_plugin.on_llm_request(event, req)
+    check(
+        "非 onebot11 平台不触发转写",
+        bot.stt_calls == [],
+        str(bot.stt_calls),
+    )
+    check(
+        "非 onebot11 平台保持原有音频行为",
+        req.audio_urls == ["/tmp/a.silk"]
+        and [getattr(p, "text", "") for p in req.extra_user_content_parts]
+        == ["[Audio Attachment: path /tmp/a.silk]"],
+    )
+    # 平台名缺失的普通事件对象同样安全（视为非 onebot11）
+    await stt_plugin.on_llm_request(_Event(), _SttReq())
+
+    # audio_mode=off：即使在 onebot11 平台也不处理语音
+    off_plugin = mod.MediaMontagePlugin(context=None, config={})
+    bot = _SttBot("off 模式不应调用")
+    event = _SttEvent(
+        [CoreRecord(file="v.amr")], raw_message={"message_id": 5}, bot=bot
+    )
+    req = _SttReq(audio_urls=["/tmp/b.silk"])
+    await off_plugin.on_llm_request(event, req)
+    check(
+        "audio_mode=off 时不处理语音",
+        bot.stt_calls == [] and req.audio_urls == ["/tmp/b.silk"],
+    )
+
     # --- 4. 官方标签解析 ---------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
         video_path = Path(tmp) / "test.mp4"
